@@ -1,0 +1,49 @@
+{
+    "base_dir": ".",
+    "strict": false,
+    "target_unit": "mm",
+    "embedding_model": "dino",
+    "matcher_model": "loma",
+    "model_configs": {
+        "clip": {
+            "image_size": 336,
+            "model_name": "PE-Core-L-14-336",
+            "model_path": "./models/PE-Core-L-14-336/open_clip_pytorch_model.bin",
+            "top_k": 3
+        },
+        "dino": {
+            "image_size": 224,
+            "model_name": "dinov3-vitl16-pretrain-lvd1689m",
+            "model_path": "./models/dinov3-vitl16-pretrain-lvd1689m",
+            "top_k": 3
+        },
+        "lightglue": {
+            "max_width": 1024,
+            "min_match_score": 0.5,
+            "min_matches": 10,
+            "score_method": "mean",
+            "top_k_matches": 100,
+            "depth_confidence": -1,
+            "width_confidence": -1
+        },
+        "loma": {
+            "model_name": "LoMa_B",
+            "min_match_score": 0.5,
+            "min_matches": 10,
+            "score_method": "mean",
+            "top_k_matches": 100,
+            "max_width": 1024,
+            "cache_features": false
+        },
+        "rf_detr": {
+            "model_path": "./models/rf_detr_seg_nano_rulers.pth",
+            "detection_threshold": 0.5
+        }
+    },
+    "ransac": {
+        "ransac_iters": 100000,
+        "ransac_method": "USAC_MAGSAC",
+        "reproj_threshold": 0.5,
+        "confidence_threshold": 0.999
+    }
+}

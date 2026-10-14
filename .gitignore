@@ -1,0 +1,24 @@
+# Local env
+.cursorignore
+.venv/
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+.env
+.env.*
+local_tests/
+
+# Models
+LightGlue/
+LoMa/
+sam3/
+models/*
+!models/.gitkeep
+
+# Dataset and outputs
+dataset/*
+!dataset/.gitkeep
+!dataset/sample_images
+outputs/
