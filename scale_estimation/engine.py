@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -204,6 +205,8 @@ class RulerMatch:
             "tick_labels": [t.to_dict() for t in self.tick_labels],
             "scale_factor_unit": self.unit,
             "method": self.method,
+            "ruler_bbox_xyxy": self.ruler_bbox_xyxy,
+            "coco_annotation_id": self.coco_annotation_id,
         }
 
 
@@ -590,6 +593,26 @@ def filter_transformed_points(
     return filtered_points, filtered_labels
 
 
+def _set_model_cache_env(base_dir: Path, *, log: bool = True) -> None:
+    """Keep LoMa and PaddleOCR weights under ``base_dir/models``.
+
+    ``setdefault`` leaves an existing TORCH_HOME or PADDLE_PDX_CACHE_HOME in place.
+    PaddleX reads its cache directory at import time, so this must run before
+    ``paddleocr`` is imported.
+    """
+    cache_dir = base_dir / "models"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TORCH_HOME", str(cache_dir))
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_dir))
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    if log:
+        logger.info(
+            "Model cache: TORCH_HOME={} | PADDLE_PDX_CACHE_HOME={}",
+            os.environ["TORCH_HOME"],
+            os.environ["PADDLE_PDX_CACHE_HOME"],
+        )
+
+
 class RulerInference:
     def __init__(
         self,
@@ -605,6 +628,7 @@ class RulerInference:
     ):
         logger.info("Initializing RulerInference")
         self.base_dir = Path(base_dir)
+        _set_model_cache_env(self.base_dir)
         self.reference_dir = (
             Path(reference_dir)
             if reference_dir is not None
@@ -1238,6 +1262,7 @@ class RulerInference:
         orig_query_img_shape: tuple[int, int],
     ) -> RulerMatch | None:
         """Estimate scale factor via line segmentation + OCR. Returns None on failure."""
+        _set_model_cache_env(self.base_dir, log=False)
         from .OCR import predict_line_OCR
 
         fname = clip_info["matched_ruler_fname"]
