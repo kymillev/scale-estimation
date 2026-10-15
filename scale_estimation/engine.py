@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
@@ -95,6 +96,10 @@ class LightglueConfig:
     top_k_matches: int = 100
     depth_confidence: int = -1
     width_confidence: int = -1
+
+
+# keypoints, descriptions, height, width from LoMa detect-and-describe.
+LomaImageFeatures = tuple[torch.Tensor, torch.Tensor, int, int]
 
 
 @dataclass
@@ -593,6 +598,35 @@ def filter_transformed_points(
     return filtered_points, filtered_labels
 
 
+def _tick() -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _elapsed_ms(start: float) -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - start) * 1000
+
+
+def _force_loma_fp32(matcher: torch.nn.Module) -> None:
+    """Run DaD and the DINOv2 descriptor in float32.
+
+    Those modules ignore LoMa's ``mp`` flag. They always autocast to the dtype
+    chosen at import, which is float16 on GPUs below compute capability 8.
+    Maxwell and Pascal run that dtype far slower than float32.
+    """
+    for module in matcher.modules():
+        if hasattr(module, "amp"):
+            module.amp = False
+        if hasattr(module, "amp_dtype"):
+            module.amp_dtype = torch.float32
+        vit = getattr(module, "dinov2_vitl14", None)
+        if vit is not None:
+            vit.float()
+
+
 def _set_model_cache_env(base_dir: Path, *, log: bool = True) -> None:
     """Keep LoMa and PaddleOCR weights under ``base_dir/models``.
 
@@ -835,21 +869,37 @@ class RulerInference:
 
             loma_name = self.loma_config.model_name
             filter_threshold = self.loma_config.min_match_score
+            loma_kwargs: dict[str, Any] = {"filter_threshold": filter_threshold}
+            # LoMa enables float16 autocast on every GPU below compute 8.0.
+            # Maxwell (Titan X, 5.2) runs fp16 much slower than fp32.
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 7:
+                loma_kwargs["mp"] = False
+                logger.info(
+                    "Disabling LoMa mixed precision on compute capability {}",
+                    torch.cuda.get_device_capability(),
+                )
             logger.info(
-                "Loading LoMa matcher {} (filter_threshold={})",
+                "Loading LoMa matcher {} (filter_threshold={}, mp={})",
                 loma_name,
                 filter_threshold,
+                loma_kwargs.get("mp", True),
             )
             if loma_name.lower() == "loma_b":
-                loma_cfg = LoMaB(filter_threshold=filter_threshold)
+                loma_cfg = LoMaB(**loma_kwargs)
             elif loma_name.lower() == "loma_r":
-                loma_cfg = LoMaR(filter_threshold=filter_threshold)
+                loma_cfg = LoMaR(**loma_kwargs)
             else:
                 raise ValueError(
                     f"Invalid LoMa model: {loma_name}. Use 'loma_B' or 'loma_R'."
                 )
             self.loma_matcher = LoMa(loma_cfg)
             self.loma_matcher.eval()
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 7:
+                _force_loma_fp32(self.loma_matcher)
+                logger.info(
+                    "LoMa detector and DINOv2 descriptor forced to float32 on compute capability {}",
+                    torch.cuda.get_device_capability(),
+                )
         else:
             from lightglue import LightGlue, SuperPoint
 
@@ -922,8 +972,10 @@ class RulerInference:
         img = _to_pil_image(input_img)
         pixel_values = self.custom_preprocess(img).unsqueeze(0).to(self.device)
         inputs = {"pixel_values": pixel_values}
+        started = _tick()
         with torch.inference_mode():
             outputs = self.dino_model(**inputs)
+        logger.debug("DINO embedding took {:.1f} ms", _elapsed_ms(started))
         embedding = outputs.pooler_output.cpu().numpy().squeeze()
         embedding = embedding / np.linalg.norm(embedding)
         return embedding
@@ -998,7 +1050,7 @@ class RulerInference:
         resized = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
         return numpy_image_to_torch(resized).unsqueeze(0).to(self.device)
 
-    def _loma_detect_and_describe_array(self, img: RGBImage):
+    def _loma_detect_and_describe_array(self, img: RGBImage) -> LomaImageFeatures:
         """
         Detect & describe an in-memory image crop using LoMa
         LoMa uses two models, which take diferent input sizes.
@@ -1022,28 +1074,43 @@ class RulerInference:
         else:
             det_w = det_h = detector.resize
         det_tensor = self._numpy_to_loma_tensor(img, det_w, det_h)
+        started = _tick()
         keypoints = detector.detect(det_tensor, num_keypoints=num_keypoints)[
             "keypoints"
         ]
+        logger.debug(
+            "LoMa detect {}x{} took {:.1f} ms",
+            det_h,
+            det_w,
+            _elapsed_ms(started),
+        )
 
         # DeDoDeDescriptor.read_image / describe_keypoints_from_path defaults
         desc_tensor = self._numpy_to_loma_tensor(img, 784, 784)
+        started = _tick()
         descriptions = descriptor.describe_keypoints(desc_tensor, keypoints)[
             "descriptions"
         ]
+        logger.debug("LoMa describe 784x784 took {:.1f} ms", _elapsed_ms(started))
         return keypoints, descriptions, orig_h, orig_w
 
     def _loma_detect_and_describe(
         self, img: str | Path | RGBImage, cache_features: bool = False
-    ):
+    ) -> LomaImageFeatures:
         if self.loma_matcher is None:
             raise RuntimeError("LoMa is not loaded (matcher_model is not 'loma')")
 
         if isinstance(img, str | Path):
             cache_path = self._loma_cache_path(img) if cache_features else None
             if cache_path is not None and cache_path.exists():
+                started = _tick()
                 with open(cache_path, "rb") as f:
                     kpts, desc, h, w = pickle.load(f)
+                logger.debug(
+                    "LoMa feature cache hit {} took {:.1f} ms",
+                    Path(img).name,
+                    _elapsed_ms(started),
+                )
                 return (
                     kpts.to(self.device),
                     desc.to(self.device),
@@ -1051,7 +1118,13 @@ class RulerInference:
                     w,
                 )
 
+            started = _tick()
             packed = self.loma_matcher.detect_and_describe(str(img))
+            logger.debug(
+                "LoMa detect_and_describe {} took {:.1f} ms",
+                Path(img).name,
+                _elapsed_ms(started),
+            )
             if cache_path is not None:
                 kpts, desc, h, w = packed
                 with open(cache_path, "wb") as f:
@@ -1070,9 +1143,15 @@ class RulerInference:
         img0: str | Path | RGBImage,
         img1: str | Path | RGBImage,
         filter_threshold: float | None = None,
+        feats0: LomaImageFeatures | None = None,
+        feats1: LomaImageFeatures | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Match keypoints with LoMa. Same return format as extract_match_keypoints_lightglue:
         kpts0, kpts1 (pixel coords), matches (N, 2 index pairs), match_scores.
+
+        ``feats0`` / ``feats1`` are optional ``(keypoints, descriptions, height, width)``
+        packs from ``_loma_detect_and_describe``. Pass them to skip detection when the
+        same image is matched more than once.
         """
         from loma.loma import filter_matches, to_pixel_coords
 
@@ -1080,15 +1159,23 @@ class RulerInference:
             raise RuntimeError("LoMa is not loaded (matcher_model is not 'loma')")
 
         cache_features = self.loma_config.cache_features
-        kpts0, desc0, h0, w0 = self._loma_detect_and_describe(
-            img0, cache_features=cache_features
-        )
-        kpts1, desc1, h1, w1 = self._loma_detect_and_describe(
-            img1, cache_features=cache_features
-        )
+        if feats0 is None:
+            kpts0, desc0, h0, w0 = self._loma_detect_and_describe(
+                img0, cache_features=cache_features
+            )
+        else:
+            kpts0, desc0, h0, w0 = feats0
+        if feats1 is None:
+            kpts1, desc1, h1, w1 = self._loma_detect_and_describe(
+                img1, cache_features=cache_features
+            )
+        else:
+            kpts1, desc1, h1, w1 = feats1
 
+        started = _tick()
         with torch.inference_mode():
             scores = self.loma_matcher(kpts0, kpts1, desc0, desc1)["scores"]
+        logger.debug("LoMa match forward took {:.1f} ms", _elapsed_ms(started))
 
         if filter_threshold is None:
             filter_threshold = self.loma_config.min_match_score
@@ -1108,13 +1195,18 @@ class RulerInference:
         self,
         img0: str | Path | RGBImage,
         img1: str | Path | RGBImage,
+        feats0: LomaImageFeatures | None = None,
+        feats1: LomaImageFeatures | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Match keypoints with the currently selected matcher (LightGlue or LoMa).
 
         Returns kpts0, kpts1, matches (N, 2), match_scores.
+        ``feats0`` / ``feats1`` are LoMa feature packs and are ignored by LightGlue.
         """
         if self.matcher_model_name == "loma":
-            return self.extract_match_keypoints_loma(img0, img1)
+            return self.extract_match_keypoints_loma(
+                img0, img1, feats0=feats0, feats1=feats1
+            )
         return self.extract_match_keypoints_lightglue(img0, img1)
 
     def _run_matching(
@@ -1136,6 +1228,13 @@ class RulerInference:
         query_img, query_img_rot, orig_query_img_shape = _prepare_query_image(
             query_img, max_width=match_cfg.max_width
         )
+        # Query crops are numpy arrays, so the on-disk LoMa cache (path stems only)
+        # never applies. Detect each orientation once and reuse it for every target.
+        query_feats: LomaImageFeatures | None = None
+        query_feats_rot: LomaImageFeatures | None = None
+        if self.matcher_model_name == "loma":
+            query_feats = self._loma_detect_and_describe(query_img)
+            query_feats_rot = self._loma_detect_and_describe(query_img_rot)
         match_results: list[dict[str, Any] | None] = []
 
         if target_paths is None:
@@ -1153,13 +1252,26 @@ class RulerInference:
             else:
                 target_name = f"candidate {i}"
             rotated = False
+            target_feats: LomaImageFeatures | None = None
+            if self.matcher_model_name == "loma":
+                target_feats = self._loma_detect_and_describe(
+                    target_input, cache_features=self.loma_config.cache_features
+                )
             kpts0, kpts1, matches, match_scores = self.extract_match_keypoints(
-                query_img, target_input
+                query_img,
+                target_input,
+                feats0=query_feats,
+                feats1=target_feats,
             )
             num_matches = len(matches)
 
             kpts0_rot, kpts1_rot, matches_rot, match_scores_rot = (
-                self.extract_match_keypoints(query_img_rot, target_input)
+                self.extract_match_keypoints(
+                    query_img_rot,
+                    target_input,
+                    feats0=query_feats_rot,
+                    feats1=target_feats,
+                )
             )
             num_matches_rot = len(matches_rot)
 
@@ -1195,6 +1307,7 @@ class RulerInference:
 
             dst_pts = kpts0[top_matches[:, 0]]
             src_pts = kpts1[top_matches[:, 1]]
+            started = _tick()
             H, _ = cv2.findHomography(
                 src_pts,
                 dst_pts,
@@ -1202,6 +1315,11 @@ class RulerInference:
                 maxIters=ransac.ransac_iters,
                 confidence=ransac.confidence_threshold,
                 ransacReprojThreshold=ransac.reproj_threshold,
+            )
+            logger.debug(
+                "Homography for {} took {:.1f} ms",
+                target_name,
+                _elapsed_ms(started),
             )
             if H is None:
                 logger.debug("No homography for {}", target_name)
@@ -1594,11 +1712,13 @@ class RulerInference:
         else:
             model_input = _load_rgb(image)
 
+        started = _tick()
         raw = self._detector.predict(
             model_input,
             threshold=float(threshold),
             include_source_image=False,
         )
+        logger.debug("RF-DETR detection took {:.1f} ms", _elapsed_ms(started))
         if isinstance(raw, list):
             raw = raw[0] if raw else None
         n_rulers = 0 if raw is None else len(raw)
